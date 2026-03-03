@@ -1,12 +1,14 @@
 import {
+  cancelSubscriptionSchema,
   createCheckoutSchema,
   getBillingOrdersSchema,
 } from "@api/schemas/billing";
 import { createTRPCRouter, protectedProcedure } from "@api/trpc/init";
 import { api } from "@api/utils/polar";
-import { getTeamById } from "@midday/db/queries";
+import { getTeamById, updateTeamById } from "@midday/db/queries";
 import { createLoggerWithContext } from "@midday/logger";
-import { getDiscount, getPlans } from "@midday/plans";
+import { getPlanIntervalByProductId, getPlanProductId } from "@midday/plans";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 const logger = createLoggerWithContext("trpc:billing");
@@ -14,8 +16,8 @@ const logger = createLoggerWithContext("trpc:billing");
 export const billingRouter = createTRPCRouter({
   createCheckout: protectedProcedure
     .input(createCheckoutSchema)
-    .mutation(async ({ input, ctx: { db, session, teamId, geo } }) => {
-      const { plan, planType, embedOrigin } = input;
+    .mutation(async ({ input, ctx: { db, session, teamId } }) => {
+      const { plan, planType, embedOrigin, currency } = input;
 
       // Get team data
       const team = await getTeamById(db, teamId!);
@@ -24,35 +26,22 @@ export const billingRouter = createTRPCRouter({
         throw new Error("Team not found");
       }
 
-      // Get plan configuration
-      const plans = getPlans();
-      const selectedPlan = plans[plan as keyof typeof plans];
-
-      if (!selectedPlan) {
-        throw new Error("Invalid plan");
-      }
-
-      // Get discount if applicable
-      const discountId = getDiscount(planType);
-
-      // Get country code from team or geo context
-      const countryCode = team.countryCode ?? geo?.country;
+      const yearly = planType?.endsWith("_yearly") ?? false;
+      const productId = getPlanProductId(plan, yearly);
 
       // Create Polar checkout
       const checkout = await api.checkouts.create({
-        products: [selectedPlan.id],
+        products: [productId],
+        allowDiscountCodes: false,
         externalCustomerId: team.id,
         customerEmail: session.user.email ?? undefined,
         customerName: team.name ?? undefined,
-        customerBillingAddress: countryCode
-          ? { country: countryCode as never }
-          : undefined,
-        discountId: discountId?.id,
         metadata: {
           teamId: team.id,
           companyName: team.name ?? "",
         },
         embedOrigin,
+        currency: currency === "EUR" ? "eur" : "usd",
       });
 
       return { url: checkout.url };
@@ -211,6 +200,30 @@ export const billingRouter = createTRPCRouter({
       }
     }),
 
+  getActiveSubscription: protectedProcedure.query(
+    async ({ ctx: { teamId } }) => {
+      try {
+        const subscriptions = await api.subscriptions.list({
+          externalCustomerId: teamId!,
+        });
+
+        const active = subscriptions.result.items.find(
+          (s) => s.status === "active" || s.status === "past_due",
+        );
+
+        if (!active) {
+          return null;
+        }
+
+        const interval = getPlanIntervalByProductId(active.productId);
+
+        return { isYearly: interval === "year" };
+      } catch {
+        return null;
+      }
+    },
+  ),
+
   getPortalUrl: protectedProcedure.mutation(async ({ ctx: { teamId } }) => {
     const result = await api.customerSessions.create({
       externalCustomerId: teamId!,
@@ -218,4 +231,100 @@ export const billingRouter = createTRPCRouter({
 
     return { url: result.customerPortalUrl };
   }),
+
+  cancelSubscription: protectedProcedure
+    .input(cancelSubscriptionSchema)
+    .mutation(async ({ input, ctx: { db, teamId } }) => {
+      const subscriptions = await api.subscriptions.list({
+        externalCustomerId: teamId!,
+      });
+
+      const activeSubscription = subscriptions.result.items.find(
+        (s) => s.status === "active" || s.status === "past_due",
+      );
+
+      if (!activeSubscription) {
+        const alreadyCanceled = subscriptions.result.items.some(
+          (s) => s.status === "canceled" || s.cancelAtPeriodEnd,
+        );
+
+        if (alreadyCanceled) {
+          logger.info("Subscription already canceled", { teamId });
+          return { success: true };
+        }
+
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "No active subscription found",
+        });
+      }
+
+      if (activeSubscription.cancelAtPeriodEnd) {
+        logger.info("Subscription already scheduled for cancellation", {
+          teamId,
+        });
+
+        return {
+          success: true,
+        };
+      }
+
+      await api.subscriptions.update({
+        id: activeSubscription.id,
+        subscriptionUpdate: {
+          cancelAtPeriodEnd: true,
+          customerCancellationReason: input.reason,
+          customerCancellationComment: input.comment,
+        },
+      });
+
+      await updateTeamById(db, {
+        id: teamId!,
+        data: { canceledAt: new Date().toISOString() },
+      });
+
+      logger.info("Subscription canceled", {
+        teamId,
+        reason: input.reason,
+      });
+
+      return { success: true };
+    }),
+
+  reactivateSubscription: protectedProcedure.mutation(
+    async ({ ctx: { db, teamId } }) => {
+      const subscriptions = await api.subscriptions.list({
+        externalCustomerId: teamId!,
+      });
+
+      const subscription = subscriptions.result.items.find(
+        (s) =>
+          (s.status === "active" || s.status === "past_due") &&
+          s.cancelAtPeriodEnd,
+      );
+
+      if (!subscription) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "No canceled subscription found to reactivate",
+        });
+      }
+
+      await api.subscriptions.update({
+        id: subscription.id,
+        subscriptionUpdate: {
+          cancelAtPeriodEnd: false,
+        },
+      });
+
+      await updateTeamById(db, {
+        id: teamId!,
+        data: { canceledAt: null },
+      });
+
+      logger.info("Subscription reactivated", { teamId });
+
+      return { success: true };
+    },
+  ),
 });

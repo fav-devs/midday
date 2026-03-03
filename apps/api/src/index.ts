@@ -4,14 +4,14 @@ import "./instrument";
 import { trpcServer } from "@hono/trpc-server";
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { closeSharedRedisClient } from "@midday/cache/shared-redis";
-import { closeDb } from "@midday/db/client";
+import { closeDb, getPoolStats } from "@midday/db/client";
 import {
   buildDependenciesResponse,
   buildReadinessResponse,
   checkDependencies,
 } from "@midday/health/checker";
 import { apiDependencies } from "@midday/health/probes";
-import { logger } from "@midday/logger";
+import { createLoggerWithContext, logger } from "@midday/logger";
 import { Scalar } from "@scalar/hono-api-reference";
 import * as Sentry from "@sentry/bun";
 import { cors } from "hono/cors";
@@ -21,6 +21,7 @@ import type { Context } from "./rest/types";
 import { createTRPCContext } from "./trpc/init";
 import { appRouter } from "./trpc/routers/_app";
 import { httpLogger } from "./utils/logger";
+import { getRequestTrace } from "./utils/request-trace";
 
 const app = new OpenAPIHono<Context>();
 
@@ -41,6 +42,9 @@ app.use(
       "Content-Type",
       "User-Agent",
       "accept-language",
+      "cf-ray",
+      "trpc-accept",
+      "x-request-id",
       "x-trpc-source",
       "x-user-locale",
       "x-user-timezone",
@@ -59,6 +63,27 @@ app.use(
     maxAge: 86400,
   }),
 );
+
+if (process.env.DEBUG_PERF === "true") {
+  const perfLogger = createLoggerWithContext("perf:trpc");
+
+  app.use("/trpc/*", async (c, next) => {
+    const start = performance.now();
+    const { requestId, cfRay } = getRequestTrace(c.req);
+    await next();
+    const elapsed = performance.now() - start;
+    const procedures = c.req.path.replace("/trpc/", "").split(",");
+    perfLogger.info("request", {
+      totalMs: +elapsed.toFixed(2),
+      procedureCount: procedures.length,
+      procedures,
+      status: c.res.status,
+      pool: getPoolStats(),
+      requestId,
+      cfRay,
+    });
+  });
+}
 
 app.use(
   "/trpc/*",
@@ -90,9 +115,7 @@ app.use(
 app.get("/favicon.ico", (c) => c.body(null, 204));
 app.get("/robots.txt", (c) => c.body(null, 204));
 
-app.get("/health", (c) => {
-  return c.json({ status: "ok" }, 200);
-});
+app.get("/health", (c) => c.json({ status: "ok" }, 200));
 
 app.get("/health/ready", async (c) => {
   const results = await checkDependencies(apiDependencies(), 1);
@@ -152,6 +175,29 @@ app.get(
 
 app.route("/", routers);
 
+const poolStatsIntervalMsRaw = process.env.DB_POOL_STATS_INTERVAL_MS;
+const parsedPoolStatsIntervalMs = Number.parseInt(
+  poolStatsIntervalMsRaw ?? "60000",
+  10,
+);
+const poolStatsIntervalMs = Number.isFinite(parsedPoolStatsIntervalMs)
+  ? parsedPoolStatsIntervalMs
+  : 60000;
+const poolStatsInterval =
+  poolStatsIntervalMs > 0
+    ? setInterval(() => {
+        logger.info("API DB pool stats", {
+          pool: getPoolStats(),
+        });
+      }, poolStatsIntervalMs)
+    : null;
+
+if (poolStatsIntervalMs <= 0) {
+  logger.info("API DB pool stats logging disabled", {
+    configuredIntervalMs: poolStatsIntervalMsRaw ?? "0",
+  });
+}
+
 // Global error handler — captures unhandled route errors to Sentry
 app.onError((err, c) => {
   Sentry.captureException(err, {
@@ -175,6 +221,10 @@ const shutdown = async (signal: string) => {
 
   const shutdownPromise = (async () => {
     try {
+      if (poolStatsInterval) {
+        clearInterval(poolStatsInterval);
+      }
+
       logger.info("Closing database connections...");
       await closeDb();
 

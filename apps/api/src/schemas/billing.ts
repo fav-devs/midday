@@ -11,6 +11,7 @@ export const createCheckoutSchema = z.object({
   plan: z.enum(["starter", "pro"]),
   planType: z.string().optional(),
   embedOrigin: z.string(),
+  currency: z.enum(["USD", "EUR"]).optional(),
 });
 
 export type CreateCheckoutSchema = z.infer<typeof createCheckoutSchema>;
@@ -20,3 +21,16 @@ export const checkoutResponseSchema = z.object({
 });
 
 export type CheckoutResponseSchema = z.infer<typeof checkoutResponseSchema>;
+
+export const cancelSubscriptionSchema = z.object({
+  reason: z.enum([
+    "too_expensive",
+    "missing_features",
+    "unused",
+    "switched_service",
+    "other",
+  ]),
+  comment: z.string().optional(),
+});
+
+export type CancelSubscriptionSchema = z.infer<typeof cancelSubscriptionSchema>;

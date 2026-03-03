@@ -474,6 +474,14 @@ export const transactions = pgTable(
       "btree",
       table.teamId.asc().nullsLast().op("uuid_ops"),
     ),
+    index("idx_transactions_reports")
+      .using(
+        "btree",
+        table.teamId.asc().nullsLast().op("uuid_ops"),
+        table.date.asc().nullsLast().op("date_ops"),
+        table.categorySlug.asc().nullsLast().op("text_ops"),
+      )
+      .where(sql`internal = false AND status != 'excluded'`),
     foreignKey({
       columns: [table.assignedId],
       foreignColumns: [users.id],
@@ -1005,6 +1013,22 @@ export const invoices = pgTable(
       .on(table.invoiceRecurringId, table.recurringSequence)
       .where(sql`invoice_recurring_id IS NOT NULL`),
     unique("invoices_scheduled_job_id_key").on(table.scheduledJobId),
+    // Invoice page query indexes
+    index("invoices_team_due_date_idx")
+      .on(table.teamId, table.dueDate.desc())
+      .where(sql`due_date IS NOT NULL`),
+    index("invoices_team_status_due_date_idx").on(
+      table.teamId,
+      table.status,
+      table.dueDate.desc(),
+    ),
+    index("invoices_team_customer_id_idx")
+      .on(table.teamId, table.customerId)
+      .where(sql`customer_id IS NOT NULL`),
+    index("invoices_customer_id_idx")
+      .on(table.customerId)
+      .where(sql`customer_id IS NOT NULL`),
+    index("invoices_team_created_at_idx").on(table.teamId, table.createdAt),
     pgPolicy("Invoices can be handled by a member of the team", {
       as: "permissive",
       for: "all",
@@ -1653,6 +1677,8 @@ export const teams = pgTable(
     exportSettings: jsonb("export_settings"),
     stripeAccountId: text("stripe_account_id"),
     stripeConnectStatus: text("stripe_connect_status"),
+    companyType: text("company_type"),
+    heardAbout: text("heard_about"),
   },
   (table) => [
     unique("teams_inbox_id_key").on(table.inboxId),

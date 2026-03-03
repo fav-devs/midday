@@ -1,15 +1,29 @@
+import { UTCDate } from "@date-fns/utc";
 import {
   CATEGORIES,
   getTaxRateForCategory,
   getTaxTypeForCountry,
 } from "@midday/categories";
-import { subDays } from "date-fns";
-import { and, eq, gt, gte, inArray, isNotNull, isNull, or } from "drizzle-orm";
+import { createLoggerWithContext } from "@midday/logger";
+import { addDays, differenceInDays, subDays } from "date-fns";
+import {
+  and,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  or,
+  sql,
+} from "drizzle-orm";
 import type { Database } from "../client";
 import {
   bankConnections,
+  invoices,
   teams,
   transactionCategories,
+  transactions,
   users,
   usersOnTeam,
 } from "../schema";
@@ -130,6 +144,8 @@ type CreateTeamParams = {
   countryCode?: string;
   fiscalYearStartMonth?: number | null;
   logoUrl?: string;
+  companyType?: string;
+  heardAbout?: string;
   switchTeam?: boolean;
 };
 
@@ -215,38 +231,58 @@ async function createSystemCategoriesForTeam(
 export const createTeam = async (db: Database, params: CreateTeamParams) => {
   const startTime = Date.now();
   const teamCreationId = `team_creation_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const logger = createLoggerWithContext(teamCreationId);
 
-  console.log(
-    `[${teamCreationId}] Starting team creation for user ${params.userId}`,
-    {
-      teamName: params.name,
-      baseCurrency: params.baseCurrency,
-      countryCode: params.countryCode,
-      email: params.email,
-      switchTeam: params.switchTeam,
-      timestamp: new Date().toISOString(),
-    },
-  );
+  logger.info(`Starting team creation for user ${params.userId}`, {
+    teamName: params.name,
+    baseCurrency: params.baseCurrency,
+    countryCode: params.countryCode,
+    email: params.email,
+    switchTeam: params.switchTeam,
+  });
 
   // Use transaction to ensure atomicity and prevent race conditions
   const teamId = await db.transaction(async (tx) => {
     try {
-      // Check if user already has teams to prevent duplicate creation
+      const TRIAL_PERIOD_DAYS = 14;
+
       const existingTeams = await tx
-        .select({ id: teams.id, name: teams.name })
+        .select({
+          id: teams.id,
+          name: teams.name,
+          plan: teams.plan,
+          createdAt: teams.createdAt,
+          canceledAt: teams.canceledAt,
+        })
         .from(usersOnTeam)
         .innerJoin(teams, eq(teams.id, usersOnTeam.teamId))
         .where(eq(usersOnTeam.userId, params.userId));
 
-      console.log(
-        `[${teamCreationId}] User existing teams count: ${existingTeams.length}`,
-        {
-          existingTeams: existingTeams.map((t) => ({ id: t.id, name: t.name })),
-        },
-      );
+      const today = new UTCDate();
+      const activeTeamCount = existingTeams.filter((t) => {
+        if (t.plan === "starter" || t.plan === "pro") return true;
+        if (t.plan === "trial" && !t.canceledAt && t.createdAt) {
+          const trialEnd = addDays(new UTCDate(t.createdAt), TRIAL_PERIOD_DAYS);
+          return differenceInDays(trialEnd, today) > 0;
+        }
+        return false;
+      }).length;
+
+      logger.info(`User existing teams count: ${existingTeams.length}`, {
+        existingTeams: existingTeams.map((t) => ({
+          id: t.id,
+          name: t.name,
+          plan: t.plan,
+        })),
+        activeTeamCount,
+      });
+
+      if (existingTeams.length > 0 && activeTeamCount < existingTeams.length) {
+        throw new Error("PAID_PLAN_REQUIRED");
+      }
 
       // Create the team
-      console.log(`[${teamCreationId}] Creating team record`);
+      logger.info("Creating team record");
       const [newTeam] = await tx
         .insert(teams)
         .values({
@@ -256,6 +292,8 @@ export const createTeam = async (db: Database, params: CreateTeamParams) => {
           fiscalYearStartMonth: params.fiscalYearStartMonth,
           logoUrl: params.logoUrl,
           email: params.email,
+          companyType: params.companyType,
+          heardAbout: params.heardAbout,
         })
         .returning({ id: teams.id });
 
@@ -263,12 +301,10 @@ export const createTeam = async (db: Database, params: CreateTeamParams) => {
         throw new Error("Failed to create team.");
       }
 
-      console.log(
-        `[${teamCreationId}] Team created successfully with ID: ${newTeam.id}`,
-      );
+      logger.info(`Team created successfully with ID: ${newTeam.id}`);
 
       // Add user to team membership (atomic with team creation)
-      console.log(`[${teamCreationId}] Adding user to team membership`);
+      logger.info("Adding user to team membership");
       await tx.insert(usersOnTeam).values({
         userId: params.userId,
         teamId: newTeam.id,
@@ -276,13 +312,13 @@ export const createTeam = async (db: Database, params: CreateTeamParams) => {
       });
 
       // Create system categories for the new team (atomic)
-      console.log(`[${teamCreationId}] Creating system categories`);
+      logger.info("Creating system categories");
       // @ts-expect-error - tx is a PgTransaction
       await createSystemCategoriesForTeam(tx, newTeam.id, params.countryCode);
 
       // Optionally switch user to the new team (atomic)
       if (params.switchTeam) {
-        console.log(`[${teamCreationId}] Switching user to new team`);
+        logger.info("Switching user to new team");
         await tx
           .update(users)
           .set({ teamId: newTeam.id })
@@ -290,31 +326,25 @@ export const createTeam = async (db: Database, params: CreateTeamParams) => {
       }
 
       const duration = Date.now() - startTime;
-      console.log(
-        `[${teamCreationId}] Team creation completed successfully in ${duration}ms`,
-        {
-          teamId: newTeam.id,
-          duration,
-        },
-      );
+      logger.info(`Team creation completed successfully in ${duration}ms`, {
+        teamId: newTeam.id,
+        duration,
+      });
 
       return newTeam.id;
     } catch (error) {
       const duration = Date.now() - startTime;
-      console.error(
-        `[${teamCreationId}] Team creation failed after ${duration}ms:`,
-        {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-          params: {
-            userId: params.userId,
-            teamName: params.name,
-            baseCurrency: params.baseCurrency,
-            countryCode: params.countryCode,
-          },
-          duration,
+      logger.error(`Team creation failed after ${duration}ms`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        params: {
+          userId: params.userId,
+          teamName: params.name,
+          baseCurrency: params.baseCurrency,
+          countryCode: params.countryCode,
         },
-      );
+        duration,
+      });
 
       // Re-throw with more specific error messages
       if (error instanceof Error) {
@@ -517,8 +547,8 @@ export async function getAvailablePlans(
   const teamMembersCount = teamMembersCountResult.length;
   const bankConnectionsCount = bankConnectionsCountResult.length;
 
-  // Can choose starter if team has 2 or fewer members and 2 or fewer bank connections
-  const starter = teamMembersCount <= 2 && bankConnectionsCount <= 2;
+  // Can choose starter if team has 2 or fewer members and 3 or fewer bank connections
+  const starter = teamMembersCount <= 2 && bankConnectionsCount <= 3;
 
   // Can always choose pro plan
   return {
@@ -722,4 +752,45 @@ function getHourInTimezone(date: Date, timezone: string): number {
     // Invalid timezone, fall back to UTC
     return date.getUTCHours();
   }
+}
+
+export async function getTeamOwnerContact(db: Database, teamId: string) {
+  const [result] = await db
+    .select({
+      email: users.email,
+      fullName: users.fullName,
+    })
+    .from(usersOnTeam)
+    .innerJoin(users, eq(usersOnTeam.userId, users.id))
+    .where(and(eq(usersOnTeam.teamId, teamId), eq(usersOnTeam.role, "owner")))
+    .limit(1);
+
+  return result ?? null;
+}
+
+export async function isTeamStillCanceled(db: Database, teamId: string) {
+  const [result] = await db
+    .select({ id: teams.id })
+    .from(teams)
+    .where(and(eq(teams.id, teamId), isNotNull(teams.canceledAt)))
+    .limit(1);
+
+  return !!result;
+}
+
+export async function hasTeamData(db: Database, teamId: string) {
+  const [result] = await db
+    .select({
+      hasData: sql<boolean>`EXISTS (
+        SELECT 1 FROM ${transactions} WHERE ${transactions.teamId} = ${teamId}
+      ) OR EXISTS (
+        SELECT 1 FROM ${bankConnections} WHERE ${bankConnections.teamId} = ${teamId}
+      ) OR EXISTS (
+        SELECT 1 FROM ${invoices} WHERE ${invoices.teamId} = ${teamId}
+      )`,
+    })
+    .from(teams)
+    .limit(1);
+
+  return result?.hasData ?? false;
 }

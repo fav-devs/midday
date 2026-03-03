@@ -36,15 +36,18 @@ export default async function Transactions(props: Props) {
   const initialSettings = await getInitialTableSettings("transactions");
 
   // Build query filters for both tabs
+  const hasFilters = Object.values(filter).some((value) => value !== null);
+
   const allTabFilter = {
     ...filter,
     amountRange: filter.amount_range ?? null,
     sort,
+    // Keep server prefetch query key aligned with client query key.
+    pageSize: hasFilters ? 10000 : undefined,
   };
 
   const reviewTabFilter = {
-    ...filter,
-    amountRange: filter.amount_range ?? null,
+    // Review is a strict queue and does not apply user filters.
     sort,
     fulfilled: true,
     exported: false,

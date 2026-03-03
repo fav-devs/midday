@@ -51,7 +51,17 @@ export type GetTransactionsParams = {
   sort?: string[] | null;
   pageSize?: number;
   q?: string | null;
-  statuses?: string[] | null;
+  statuses?:
+    | (
+        | "blank"
+        | "receipt_match"
+        | "in_review"
+        | "export_error"
+        | "exported"
+        | "excluded"
+        | "archived"
+      )[]
+    | null;
   attachments?: "include" | "exclude" | null;
   categories?: string[] | null;
   tags?: string[] | null;
@@ -117,8 +127,8 @@ export async function getTransactions(
 
   // Search query filter (name, description, or amount)
   if (q) {
-    const numericQ = Number.parseFloat(q);
-    if (!Number.isNaN(numericQ)) {
+    const numericQ = Number(q);
+    if (!Number.isNaN(numericQ) && q.trim() !== "") {
       whereConditions.push(sql`${transactions.amount} = ${numericQ}`);
     } else {
       const searchQuery = buildSearchQuery(q);
@@ -131,43 +141,118 @@ export async function getTransactions(
     }
   }
 
-  // Status filtering - simplified logic using direct EXISTS subqueries
-  if (statuses?.includes("uncompleted") || attachments === "exclude") {
-    // Transaction is NOT fulfilled (no attachments AND status is not completed) AND status is not excluded
-    whereConditions.push(
-      sql`NOT (EXISTS (SELECT 1 FROM ${transactionAttachments} WHERE ${eq(transactionAttachments.transactionId, transactions.id)} AND ${eq(transactionAttachments.teamId, teamId)}) OR ${transactions.status} = 'completed') AND ${transactions.status} != 'excluded'`,
-    );
-  } else if (statuses?.includes("completed") || attachments === "include") {
-    // Transaction is fulfilled (has attachments OR status is completed)
-    whereConditions.push(
-      sql`(EXISTS (SELECT 1 FROM ${transactionAttachments} WHERE ${eq(transactionAttachments.transactionId, transactions.id)} AND ${eq(transactionAttachments.teamId, teamId)}) OR ${transactions.status} = 'completed')`,
-    );
-  } else if (statuses?.includes("excluded")) {
-    whereConditions.push(eq(transactions.status, "excluded"));
-  } else if (statuses?.includes("archived")) {
-    whereConditions.push(eq(transactions.status, "archived"));
-  } else if (statuses?.includes("exported")) {
-    // Show all exported transactions: manually marked OR synced to accounting provider
-    whereConditions.push(
-      sql`(
-        ${transactions.status} = 'exported' OR EXISTS (
-          SELECT 1 FROM ${accountingSyncRecords}
-          WHERE ${accountingSyncRecords.transactionId} = ${transactions.id}
-          AND ${accountingSyncRecords.teamId} = ${teamId}
-          AND ${accountingSyncRecords.status} = 'synced'
-        )
-      )`,
-    );
+  const isFulfilledCondition = sql`(
+    EXISTS (
+      SELECT 1
+      FROM ${transactionAttachments}
+      WHERE ${eq(transactionAttachments.transactionId, transactions.id)}
+      AND ${eq(transactionAttachments.teamId, teamId)}
+    ) OR ${transactions.status} = 'completed'
+  )`;
+
+  const isExportedCondition = sql`(
+    ${transactions.status} = 'exported' OR EXISTS (
+      SELECT 1
+      FROM ${accountingSyncRecords}
+      WHERE ${accountingSyncRecords.transactionId} = ${transactions.id}
+      AND ${accountingSyncRecords.teamId} = ${teamId}
+      AND ${accountingSyncRecords.status} = 'synced'
+    )
+  )`;
+
+  const hasExportErrorCondition = sql`EXISTS (
+    SELECT 1
+    FROM ${accountingSyncRecords}
+    WHERE ${accountingSyncRecords.transactionId} = ${transactions.id}
+    AND ${accountingSyncRecords.teamId} = ${teamId}
+    AND ${accountingSyncRecords.status} IN ('failed', 'partial')
+  )`;
+
+  const hasPendingSuggestionCondition = sql`EXISTS (
+    SELECT 1
+    FROM ${transactionMatchSuggestions}
+    WHERE ${transactionMatchSuggestions.transactionId} = ${transactions.id}
+    AND ${transactionMatchSuggestions.teamId} = ${teamId}
+    AND ${transactionMatchSuggestions.status} = 'pending'
+  )`;
+
+  const isActiveWorkflowCondition = sql`${transactions.status} NOT IN ('excluded', 'archived')`;
+
+  if (attachments === "exclude") {
+    whereConditions.push(sql`NOT (${isFulfilledCondition})`);
+  } else if (attachments === "include") {
+    whereConditions.push(isFulfilledCondition);
+  }
+
+  // UI status filters map to computed states. DB status remains unchanged.
+  if (statuses && statuses.length > 0) {
+    const statusConditions: SQL[] = [];
+
+    if (statuses.includes("blank")) {
+      statusConditions.push(
+        sql`(
+          ${isActiveWorkflowCondition}
+          AND NOT (${isFulfilledCondition})
+          AND NOT (${isExportedCondition})
+          AND NOT (${hasExportErrorCondition})
+        )`,
+      );
+    }
+
+    if (statuses.includes("receipt_match")) {
+      statusConditions.push(
+        sql`(
+          ${isActiveWorkflowCondition}
+          AND ${hasPendingSuggestionCondition}
+          AND NOT (${isFulfilledCondition})
+          AND NOT (${isExportedCondition})
+        )`,
+      );
+    }
+
+    if (statuses.includes("in_review")) {
+      statusConditions.push(
+        sql`(
+          ${isActiveWorkflowCondition}
+          AND ${isFulfilledCondition}
+          AND NOT (${isExportedCondition})
+          AND NOT (${hasExportErrorCondition})
+        )`,
+      );
+    }
+
+    if (statuses.includes("export_error")) {
+      statusConditions.push(
+        sql`(
+          ${isActiveWorkflowCondition}
+          AND ${hasExportErrorCondition}
+          AND NOT (${isExportedCondition})
+        )`,
+      );
+    }
+
+    if (statuses.includes("exported")) {
+      statusConditions.push(isExportedCondition);
+    }
+
+    if (statuses.includes("excluded")) {
+      statusConditions.push(eq(transactions.status, "excluded"));
+    }
+
+    if (statuses.includes("archived")) {
+      statusConditions.push(eq(transactions.status, "archived"));
+    }
+
+    if (statusConditions.length > 0) {
+      whereConditions.push(or(...statusConditions));
+    } else {
+      // All values were unrecognized — fall back to default exclusion so
+      // archived/excluded transactions don't leak into results.
+      whereConditions.push(isActiveWorkflowCondition);
+    }
   } else {
-    // Default: pending, posted, completed, or exported (exclude archived/excluded)
-    whereConditions.push(
-      inArray(transactions.status, [
-        "pending",
-        "posted",
-        "completed",
-        "exported",
-      ]),
-    );
+    // Default All tab behavior: hide excluded/archived unless explicitly filtered.
+    whereConditions.push(isActiveWorkflowCondition);
   }
 
   // Categories filter with child category expansion
@@ -437,6 +522,8 @@ export async function getTransactions(
       taxRate: transactions.taxRate,
       taxType: transactions.taxType,
       taxAmount: transactions.taxAmount,
+      baseAmount: transactions.baseAmount,
+      baseCurrency: transactions.baseCurrency,
       enrichmentCompleted: transactions.enrichmentCompleted,
       isFulfilled:
         sql<boolean>`(EXISTS (SELECT 1 FROM ${transactionAttachments} WHERE ${eq(transactionAttachments.transactionId, transactions.id)} AND ${eq(transactionAttachments.teamId, teamId)}) OR ${transactions.status} = 'completed')`.as(
@@ -730,6 +817,8 @@ export async function getTransactionById(
       taxRate: transactions.taxRate,
       taxType: transactions.taxType,
       taxAmount: transactions.taxAmount,
+      baseAmount: transactions.baseAmount,
+      baseCurrency: transactions.baseCurrency,
       enrichmentCompleted: transactions.enrichmentCompleted,
       isFulfilled:
         sql<boolean>`(EXISTS (SELECT 1 FROM ${transactionAttachments} WHERE ${eq(transactionAttachments.transactionId, transactions.id)} AND ${eq(transactionAttachments.teamId, params.teamId)})) OR ${transactions.status} = 'completed'`.as(
@@ -1602,6 +1691,8 @@ export async function getTransactionsByIds(
       tax_type: transactions.taxType,
       tax_rate: transactions.taxRate,
       tax_amount: transactions.taxAmount,
+      base_amount: transactions.baseAmount,
+      base_currency: transactions.baseCurrency,
       status: transactions.status,
       attachments: sql<
         Array<{
@@ -1954,47 +2045,23 @@ export type UpsertTransactionsParams = {
 
 /**
  * Bulk upsert transactions with conflict handling on internalId
- * Used by import-transactions and update-account-base-currency processors
+ * Used by import-transactions processor. Skips duplicates (onConflictDoNothing).
  */
 export async function upsertTransactions(
   db: Database,
   params: UpsertTransactionsParams,
 ): Promise<Array<{ id: string }>> {
-  const { transactions: transactionsData, teamId } = params;
+  // Exclude teamId from the params
+  const { transactions: transactionsData, teamId: _teamId } = params;
+  if (transactionsData.length === 0) {
+    return [];
+  }
 
   const upserted = await db
     .insert(transactions)
     .values(transactionsData)
-    .onConflictDoUpdate({
+    .onConflictDoNothing({
       target: [transactions.internalId],
-      set: {
-        // Update all fields except id and createdAt
-        name: sql`excluded.name`,
-        amount: sql`excluded.amount`,
-        currency: sql`excluded.currency`,
-        date: sql`excluded.date`,
-        description: sql`excluded.description`,
-        method: sql`excluded.method`,
-        status: sql`excluded.status`,
-        balance: sql`excluded.balance`,
-        note: sql`excluded.note`,
-        categorySlug: sql`excluded.category_slug`,
-        counterpartyName: sql`excluded.counterparty_name`,
-        merchantName: sql`excluded.merchant_name`,
-        bankAccountId: sql`excluded.bank_account_id`,
-        assignedId: sql`excluded.assigned_id`,
-        internal: sql`excluded.internal`,
-        notified: sql`excluded.notified`,
-        manual: sql`excluded.manual`,
-        baseAmount: sql`excluded.base_amount`,
-        baseCurrency: sql`excluded.base_currency`,
-        taxAmount: sql`excluded.tax_amount`,
-        taxRate: sql`excluded.tax_rate`,
-        taxType: sql`excluded.tax_type`,
-        recurring: sql`excluded.recurring`,
-        frequency: sql`excluded.frequency`,
-        enrichmentCompleted: sql`excluded.enrichment_completed`,
-      },
     })
     .returning({
       id: transactions.id,
@@ -2029,6 +2096,36 @@ export async function getTransactionsByAccountId(
     );
 }
 
+export type GetTransactionCountByBankAccountIdParams = {
+  bankAccountId: string;
+  teamId: string;
+};
+
+/**
+ * Get transaction count for a bank account
+ * Used by delete bank account dialog to show impact
+ */
+export async function getTransactionCountByBankAccountId(
+  db: Database,
+  params: GetTransactionCountByBankAccountIdParams,
+): Promise<number> {
+  const { bankAccountId, teamId } = params;
+
+  const [result] = await db
+    .select({
+      count: sql<number>`COUNT(*)::int`.as("count"),
+    })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.bankAccountId, bankAccountId),
+        eq(transactions.teamId, teamId),
+      ),
+    );
+
+  return result?.count ?? 0;
+}
+
 export type BulkUpdateTransactionsBaseCurrencyParams = {
   transactions: Array<{
     id: string;
@@ -2040,85 +2137,46 @@ export type BulkUpdateTransactionsBaseCurrencyParams = {
 
 /**
  * Bulk update transactions with base currency/amount
- * Uses batch processing internally for large datasets
+ * Uses per-row updates in a transaction — avoids array serialization issues
+ * with postgres.js + Drizzle (unnest expands arrays into many params).
  */
 export async function bulkUpdateTransactionsBaseCurrency(
   db: Database,
   params: BulkUpdateTransactionsBaseCurrencyParams,
 ) {
   const { transactions: transactionsData, teamId } = params;
-  const BATCH_LIMIT = 500;
 
-  // Process in batches
-  for (let i = 0; i < transactionsData.length; i += BATCH_LIMIT) {
-    const batch = transactionsData.slice(i, i + BATCH_LIMIT);
+  if (!teamId?.trim()) {
+    throw new Error("bulkUpdateTransactionsBaseCurrency: teamId is required");
+  }
 
-    // Get existing transactions to preserve all fields
-    const transactionIds = batch.map((tx) => tx.id);
-    const existingTransactions = await db
-      .select()
-      .from(transactions)
-      .where(
-        and(
-          inArray(transactions.id, transactionIds),
-          eq(transactions.teamId, teamId),
-        ),
-      );
+  if (transactionsData.length === 0) return;
 
-    // Create upsert data preserving all existing fields, updating only baseAmount and baseCurrency
-    const upsertData: UpsertTransactionData[] = existingTransactions.map(
-      (tx) => {
-        const update = batch.find((b) => b.id === tx.id);
-        return {
-          name: tx.name,
-          date: tx.date,
-          method: tx.method as "other" | "card_purchase" | "transfer",
-          amount: Number(tx.amount),
-          currency: tx.currency ?? "",
-          teamId: tx.teamId,
-          bankAccountId: tx.bankAccountId ?? null,
-          internalId: tx.internalId ?? "",
-          status: (tx.status ?? "posted") as
-            | "pending"
-            | "completed"
-            | "archived"
-            | "posted"
-            | "excluded",
-          manual: tx.manual ?? false,
-          categorySlug: tx.categorySlug,
-          description: tx.description,
-          balance: tx.balance ? Number(tx.balance) : null,
-          note: tx.note,
-          counterpartyName: tx.counterpartyName,
-          merchantName: tx.merchantName,
-          assignedId: tx.assignedId,
-          internal: tx.internal ?? false,
-          notified: tx.notified ?? false,
-          baseAmount:
-            update?.baseAmount ??
-            (tx.baseAmount ? Number(tx.baseAmount) : null),
-          baseCurrency: update?.baseCurrency ?? tx.baseCurrency ?? null,
-          taxAmount: tx.taxAmount ? Number(tx.taxAmount) : null,
-          taxRate: tx.taxRate ? Number(tx.taxRate) : null,
-          taxType: tx.taxType,
-          recurring: tx.recurring ?? false,
-          frequency: tx.frequency as
-            | "weekly"
-            | "biweekly"
-            | "monthly"
-            | "semi_monthly"
-            | "annually"
-            | "irregular"
-            | "unknown"
-            | null,
-          enrichmentCompleted: tx.enrichmentCompleted ?? false,
-        };
-      },
-    );
+  const BATCH_SIZE = 100;
+  const CONCURRENCY = 10;
 
-    await upsertTransactions(db, {
-      transactions: upsertData,
-      teamId,
+  for (let i = 0; i < transactionsData.length; i += BATCH_SIZE) {
+    const batch = transactionsData.slice(i, i + BATCH_SIZE);
+    await db.transaction(async (tx) => {
+      for (let j = 0; j < batch.length; j += CONCURRENCY) {
+        const chunk = batch.slice(j, j + CONCURRENCY);
+        await Promise.all(
+          chunk.map((item) =>
+            tx
+              .update(transactions)
+              .set({
+                baseAmount: item.baseAmount,
+                baseCurrency: item.baseCurrency,
+              })
+              .where(
+                and(
+                  eq(transactions.id, item.id),
+                  eq(transactions.teamId, teamId),
+                ),
+              ),
+          ),
+        );
+      }
     });
   }
 }
@@ -2181,13 +2239,19 @@ export async function getTransactionsReadyForExportCount(
 export async function markTransactionsAsExported(
   db: Database,
   transactionIds: string[],
+  teamId: string,
 ): Promise<void> {
   if (transactionIds.length === 0) return;
 
   await db
     .update(transactions)
     .set({ status: "exported" })
-    .where(inArray(transactions.id, transactionIds));
+    .where(
+      and(
+        inArray(transactions.id, transactionIds),
+        eq(transactions.teamId, teamId),
+      ),
+    );
 }
 
 /**

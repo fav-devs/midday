@@ -171,4 +171,20 @@ export const LogEvents = {
     name: "Onboarding Completed",
     channel: "onboarding",
   },
+  CTA: {
+    name: "CTA Clicked",
+    channel: "website",
+  },
+  CheckoutStarted: {
+    name: "Checkout Started",
+    channel: "billing",
+  },
+  CheckoutCompleted: {
+    name: "Checkout Completed",
+    channel: "billing",
+  },
+  SubscriptionCanceled: {
+    name: "Subscription Canceled",
+    channel: "billing",
+  },
 };

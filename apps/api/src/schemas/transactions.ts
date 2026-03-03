@@ -123,13 +123,23 @@ export const getTransactionsSchema = z.object({
       },
     }),
   statuses: z
-    .array(z.string())
+    .array(
+      z.enum([
+        "blank",
+        "receipt_match",
+        "in_review",
+        "export_error",
+        "exported",
+        "excluded",
+        "archived",
+      ]),
+    )
     .nullable()
     .optional()
     .openapi({
       description:
-        "Array of transaction statuses to filter by. Available statuses: 'pending', 'completed', 'archived', 'posted', 'excluded'",
-      example: ["pending", "completed"],
+        "Array of transaction list status filters. Supported UI filters: 'blank', 'receipt_match', 'in_review', 'export_error', 'exported', 'excluded', 'archived'",
+      example: ["in_review", "export_error"],
       param: {
         in: "query",
       },
@@ -497,7 +507,7 @@ export const transactionsResponseSchema = z.object({
 
 export const deleteTransactionsSchema = z
   .array(z.string().uuid())
-  .max(100)
+  .max(1000)
   .min(1)
   .openapi({
     description: "List of transaction IDs to delete.",
@@ -876,6 +886,7 @@ export const exportTransactionsSchema = z.object({
       includeCSV: z.boolean(),
       includeXLSX: z.boolean(),
       sendEmail: z.boolean(),
+      sendCopyToMe: z.boolean().optional(),
       accountantEmail: z.string().optional(),
     })
     .refine(
@@ -904,12 +915,32 @@ export const importTransactionsSchema = z.object({
   currency: z.string(),
   currentBalance: z.string().optional(),
   inverted: z.boolean(),
-  mappings: z.object({
-    amount: z.string(),
-    date: z.string(),
-    description: z.string(),
-    balance: z.string().optional(),
-  }),
+  mappings: z
+    .object({
+      amount: z.string(),
+      date: z.string(),
+      description: z.string().optional(),
+      counterparty: z.string().optional(),
+      balance: z.string().optional(),
+    })
+    .refine((mappings) => !!mappings.description || !!mappings.counterparty, {
+      message: "Either description or counterparty mapping is required",
+      path: ["description"],
+    }),
+});
+
+export const generateCsvMappingSchema = z.object({
+  fieldColumns: z.array(z.string()).min(1),
+  firstRows: z.array(z.record(z.string(), z.string())).min(1),
+});
+
+export const generateCsvMappingResponseSchema = z.object({
+  date: z.string().optional(),
+  description: z.string().optional(),
+  counterparty: z.string().optional(),
+  amount: z.string().optional(),
+  balance: z.string().optional(),
+  currency: z.string().optional(),
 });
 
 export const moveToReviewSchema = z.object({

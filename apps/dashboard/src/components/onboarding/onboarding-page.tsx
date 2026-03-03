@@ -291,7 +291,12 @@ export function OnboardingPage({
       {
         key: "start-trial",
         animation: <DashboardImageAnimation />,
-        content: <StartTrialStep />,
+        content: (
+          <StartTrialStep
+            hasBankConnected={!!bankSync}
+            hasInboxConnected={!!inboxSync}
+          />
+        ),
         overlay: true,
         navigation: "finish",
         canGoBack: true,
@@ -308,6 +313,8 @@ export function OnboardingPage({
       handleLoadingChange,
       handleBankSyncStarted,
       nextStep,
+      bankSync,
+      inboxSync,
     ],
   );
 
@@ -378,7 +385,7 @@ export function OnboardingPage({
             )}
           </div>
 
-          <div className="flex-1 flex flex-col justify-center pt-20 min-h-0">
+          <div className="flex-1 flex flex-col justify-center pt-20 min-h-0 overflow-y-auto scrollbar-hide">
             <motion.div
               layout
               transition={{ layout: { duration: 0.3, ease: "easeInOut" } }}
@@ -436,7 +443,10 @@ export function OnboardingPage({
                         onClick={handleNavigation}
                         className="px-4 py-2 bg-secondary border border-border text-foreground text-sm hover:bg-accent transition-colors"
                       >
-                        {navLabel}
+                        {currentStep.key === "connect-bank" ||
+                        currentStep.key === "connect-inbox"
+                          ? "Skip for now"
+                          : navLabel}
                       </button>
                     )}
                     {currentStep.navigation === "finish" && (

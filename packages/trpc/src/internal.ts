@@ -1,6 +1,7 @@
 import type { AppRouter } from "@midday/api/trpc/routers/_app";
 import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import superjson from "superjson";
+import { fetchWithRetry } from "./fetch-with-retry";
 
 /**
  * Create a tRPC client for internal service-to-service calls.
@@ -33,6 +34,9 @@ export function createInternalClient() {
       httpBatchLink({
         url: trpcUrl,
         transformer: superjson,
+        // @ts-expect-error -- native Response.body (ReadableStream<any>) is not structurally
+        // compatible with tRPC's ResponseEsque (ReadableStream<Uint8Array>) due to getReader() generics
+        fetch: fetchWithRetry,
         headers() {
           return {
             "x-internal-key": internalApiKey,

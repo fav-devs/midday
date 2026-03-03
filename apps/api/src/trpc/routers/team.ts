@@ -15,7 +15,6 @@ import { createTRPCRouter, protectedProcedure } from "@api/trpc/init";
 import type { InviteTeamMembersPayload } from "@jobs/schema";
 import { chatCache } from "@midday/cache/chat-cache";
 import { teamCache } from "@midday/cache/team-cache";
-import { teamPermissionsCache } from "@midday/cache/team-permissions-cache";
 import {
   acceptTeamInvite,
   createTeam,
@@ -71,14 +70,34 @@ export const teamRouter = createTRPCRouter({
   create: protectedProcedure
     .input(createTeamSchema)
     .mutation(async ({ ctx: { db, session }, input }) => {
-      const teamId = await createTeam(db, {
-        ...input,
-        userId: session.user.id,
-        email: session.user.email!,
-      });
+      let teamId: string;
+
+      try {
+        teamId = await createTeam(db, {
+          ...input,
+          userId: session.user.id,
+          email: session.user.email!,
+          companyType: input.companyType,
+        });
+      } catch (error) {
+        if (error instanceof Error) {
+          if (error.message === "PAID_PLAN_REQUIRED") {
+            throw new TRPCError({
+              code: "FORBIDDEN",
+              message:
+                "All existing teams must be on a paid plan before creating another",
+            });
+          }
+        }
+        throw error;
+      }
 
       if (input.switchTeam) {
-        await teamPermissionsCache.delete(`user:${session.user.id}:team`);
+        try {
+          await teamCache.invalidateForUser(session.user.id);
+        } catch {
+          // Non-fatal — cache will expire naturally
+        }
       }
 
       return teamId;
@@ -106,7 +125,11 @@ export const teamRouter = createTRPCRouter({
         teamId: input.teamId,
       });
 
-      await teamPermissionsCache.delete(`user:${session.user.id}:team`);
+      try {
+        await teamCache.invalidateForUser(session.user.id, input.teamId);
+      } catch {
+        // Non-fatal — cache will expire naturally
+      }
 
       return result;
     }),
@@ -114,9 +137,17 @@ export const teamRouter = createTRPCRouter({
   acceptInvite: protectedProcedure
     .input(acceptTeamInviteSchema)
     .mutation(async ({ ctx: { db, session }, input }) => {
+      if (!session.user.email) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Email is required to accept an invite",
+        });
+      }
+
       return acceptTeamInvite(db, {
         id: input.id,
         userId: session.user.id,
+        userEmail: session.user.email,
       });
     }),
 
@@ -191,8 +222,7 @@ export const teamRouter = createTRPCRouter({
           chatCache.invalidateTeamContext(input.teamId),
           ...data.memberUserIds.map((userId) =>
             Promise.all([
-              teamPermissionsCache.delete(`user:${userId}:team`),
-              teamCache.delete(`user:${userId}:team:${input.teamId}`),
+              teamCache.invalidateForUser(userId, input.teamId),
               chatCache.invalidateUserContext(userId, input.teamId),
             ]),
           ),
@@ -238,10 +268,18 @@ export const teamRouter = createTRPCRouter({
         }
       }
 
-      return deleteTeamMember(db, {
+      const result = await deleteTeamMember(db, {
         teamId: input.teamId,
         userId: input.userId,
       });
+
+      try {
+        await teamCache.invalidateForUser(input.userId, input.teamId);
+      } catch {
+        // Non-fatal — cache will expire naturally
+      }
+
+      return result;
     }),
 
   updateMember: protectedProcedure
@@ -296,6 +334,14 @@ export const teamRouter = createTRPCRouter({
   invite: protectedProcedure
     .input(inviteTeamMembersSchema)
     .mutation(async ({ ctx: { db, session, teamId, geo }, input }) => {
+      const invitedByEmail = session.user.email;
+      if (!invitedByEmail) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Email is required to invite team members",
+        });
+      }
+
       const ip = geo.ip ?? "127.0.0.1";
 
       const data = await createTeamInvites(db, {
@@ -309,14 +355,22 @@ export const teamRouter = createTRPCRouter({
       const results = data?.results ?? [];
       const skippedInvites = data?.skippedInvites ?? [];
 
-      const invites = results.map((invite) => ({
-        email: invite?.email!,
-        invitedBy: session.user.id!,
-        invitedByName: session.user.full_name!,
-        invitedByEmail: session.user.email!,
-        teamName: invite?.team?.name!,
-        inviteCode: invite?.code!,
-      }));
+      const invites: InviteTeamMembersPayload["invites"] = results.flatMap(
+        (invite) => {
+          if (!invite?.email) {
+            return [];
+          }
+
+          return [
+            {
+              email: invite.email,
+              invitedByName: session.user.full_name ?? "",
+              invitedByEmail,
+              teamName: invite.team?.name ?? "",
+            },
+          ];
+        },
+      );
 
       // Only trigger email sending if there are valid invites
       if (invites.length > 0) {

@@ -13,14 +13,17 @@ import {
   FormMessage,
 } from "@midday/ui/form";
 import { Input } from "@midday/ui/input";
+import { useToast } from "@midday/ui/use-toast";
 import { getDefaultFiscalYearStartMonth } from "@midday/utils";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { use, useEffect, useRef, useState } from "react";
 import { z } from "zod/v3";
 import { CountrySelector } from "@/components/country-selector";
+import { SelectCompanyType } from "@/components/select-company-type";
 import { SelectCurrency } from "@/components/select-currency";
 import { SelectFiscalMonth } from "@/components/select-fiscal-month";
+import { SelectHeardAbout } from "@/components/select-heard-about";
 import { useZodForm } from "@/hooks/use-zod-form";
 import { useTRPC } from "@/trpc/client";
 
@@ -29,6 +32,34 @@ const formSchema = z.object({
   countryCode: z.string(),
   baseCurrency: z.string(),
   fiscalYearStartMonth: z.number().int().min(1).max(12).nullable().optional(),
+  companyType: z.enum(
+    [
+      "freelancer",
+      "solo_founder",
+      "small_team",
+      "startup",
+      "agency",
+      "ecommerce",
+      "creator",
+      "non_profit",
+      "accountant",
+      "exploring",
+    ],
+    { required_error: "Please select a company type." },
+  ),
+  heardAbout: z.enum(
+    [
+      "twitter",
+      "youtube",
+      "friend",
+      "google",
+      "blog",
+      "podcast",
+      "github",
+      "other",
+    ],
+    { required_error: "Please select an option." },
+  ),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -52,6 +83,7 @@ export function CreateTeamStep({
   const countryCode = use(defaultCountryCodePromise);
   const trpc = useTRPC();
   const queryClient = useQueryClient();
+  const { toast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
   const isSubmittedRef = useRef(false);
 
@@ -63,13 +95,25 @@ export function CreateTeamStep({
           channel: LogEvents.OnboardingTeamCreated.channel,
           countryCode: form.getValues("countryCode"),
           currency: form.getValues("baseCurrency"),
+          companyType: form.getValues("companyType"),
+          heardAbout: form.getValues("heardAbout"),
         });
         await queryClient.invalidateQueries();
         onComplete();
       },
-      onError: () => {
+      onError: (error) => {
         setIsLoading(false);
         isSubmittedRef.current = false;
+
+        toast({
+          duration: 6000,
+          title: "Unable to create team",
+          variant: "info",
+          description:
+            error.data?.code === "FORBIDDEN"
+              ? "All existing teams must be on a paid plan before creating another."
+              : "Something went wrong. Please try again.",
+        });
       },
     }),
   );
@@ -114,6 +158,8 @@ export function CreateTeamStep({
         baseCurrency: values.baseCurrency,
         countryCode: values.countryCode,
         fiscalYearStartMonth: values.fiscalYearStartMonth,
+        companyType: values.companyType,
+        heardAbout: values.heardAbout,
         switchTeam: true,
       });
     } catch {
@@ -149,12 +195,16 @@ export function CreateTeamStep({
         transition={{ duration: 0.35, delay: 0.3 }}
       >
         <Form {...form}>
-          <form id="create-team-form" onSubmit={form.handleSubmit(onSubmit)}>
+          <form
+            id="create-team-form"
+            onSubmit={form.handleSubmit(onSubmit)}
+            className="space-y-4"
+          >
             <FormField
               control={form.control}
               name="name"
               render={({ field }) => (
-                <FormItem className="mt-4 w-full">
+                <FormItem>
                   <FormLabel className="text-xs text-primary font-normal">
                     Company name
                   </FormLabel>
@@ -179,7 +229,7 @@ export function CreateTeamStep({
               control={form.control}
               name="countryCode"
               render={({ field }) => (
-                <FormItem className="mt-4 w-full">
+                <FormItem>
                   <FormLabel className="text-xs text-primary font-normal">
                     Country
                   </FormLabel>
@@ -198,55 +248,99 @@ export function CreateTeamStep({
               )}
             />
 
-            <FormField
-              control={form.control}
-              name="baseCurrency"
-              render={({ field }) => (
-                <FormItem className="mt-4">
-                  <FormLabel className="text-xs text-primary font-normal">
-                    Base currency
-                  </FormLabel>
-                  <FormControl>
-                    <SelectCurrency
-                      currencies={uniqueCurrencies}
-                      triggerClassName="bg-secondary border-border text-foreground"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription className="mt-2 text-[11px] text-muted-foreground leading-relaxed">
-                    If you have multiple accounts in different currencies, this
-                    will be the default currency for your company. You can
-                    change it later.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <div className="space-y-1.5">
+              <div className="grid grid-cols-2 gap-3">
+                <FormField
+                  control={form.control}
+                  name="baseCurrency"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs text-primary font-normal">
+                        Base currency
+                      </FormLabel>
+                      <FormControl>
+                        <SelectCurrency
+                          currencies={uniqueCurrencies}
+                          triggerClassName="bg-secondary border-border text-foreground"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
 
-            <FormField
-              control={form.control}
-              name="fiscalYearStartMonth"
-              render={({ field }) => (
-                <FormItem className="mt-4">
-                  <FormLabel className="text-xs text-primary font-normal">
-                    Fiscal year starts
-                  </FormLabel>
-                  <FormControl>
-                    <SelectFiscalMonth
-                      triggerClassName="bg-secondary border-border text-foreground"
-                      popoverProps={{ side: "bottom", avoidCollisions: false }}
-                      listClassName="max-h-[150px]"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription className="mt-2 text-[11px] text-muted-foreground leading-relaxed">
-                    When does your company's fiscal year begin? This determines
-                    default date ranges for reports. You can change it later.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+                <FormField
+                  control={form.control}
+                  name="fiscalYearStartMonth"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs text-primary font-normal">
+                        Fiscal year starts
+                      </FormLabel>
+                      <FormControl>
+                        <SelectFiscalMonth
+                          triggerClassName="bg-secondary border-border text-foreground"
+                          popoverProps={{
+                            side: "bottom",
+                            avoidCollisions: false,
+                          }}
+                          listClassName="max-h-[150px]"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+              <FormDescription className="text-[11px] text-muted-foreground">
+                Used for reports and default date ranges. You can change these
+                later.
+              </FormDescription>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 border-t border-border pt-4">
+              <FormField
+                control={form.control}
+                name="companyType"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs text-primary font-normal">
+                      What best describes you?
+                    </FormLabel>
+                    <FormControl>
+                      <SelectCompanyType
+                        value={field.value}
+                        onChange={field.onChange}
+                        className="bg-secondary border-border text-foreground"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="heardAbout"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs text-primary font-normal">
+                      How did you hear about us?
+                    </FormLabel>
+                    <FormControl>
+                      <SelectHeardAbout
+                        value={field.value}
+                        onChange={field.onChange}
+                        className="bg-secondary border-border text-foreground"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
           </form>
         </Form>
       </motion.div>

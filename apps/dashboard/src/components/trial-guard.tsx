@@ -21,7 +21,6 @@ export function TrialGuard({
 }: TrialGuardProps) {
   const pathname = usePathname();
 
-  // Re-evaluate on every render (which happens on navigation)
   const showUpgradeContent = shouldShowUpgradeContent(
     plan,
     createdAt,
